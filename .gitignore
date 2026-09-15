@@ -1,0 +1,19 @@
+# Runtime output / logs
+output*.txt
+outputbf.txt
+input.txt
+.logcat_output.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
