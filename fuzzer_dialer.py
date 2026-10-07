@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
+@sd0lv
+
 DIALER CODE FUZZER AND BRUTEFORCER
 
 Discover Android hidden "secret codes" (engineering / diagnostic menus) over adb
@@ -9,8 +11,8 @@ during an *authorized* mobile security assessment.
 
 Two approaches:
 
-  * Enumeration mode (-e), RECOMMENDED: statically list every secret code
-    registered on the device by parsing the PackageManager
+  * List secret codes mode (-l / --list-secrets), RECOMMENDED: statically list
+    every secret code registered on the device by parsing the PackageManager
     (android.provider.Telephony.SECRET_CODE receivers). Vendor-independent,
     fast, and dials NOTHING -- so it can never trigger a destructive code.
 
@@ -21,13 +23,26 @@ Two approaches:
         ParseService: uri : android_secret_code://<code>
     A --vendor generic profile matches the AOSP broadcast but is unverified on
     non-Samsung devices. Adjust the MATCH_* constants below for other vendors.
+    
+ usage: fuzzer_dialer.py [-h] [-i INPUTFILE] -o OUTPUTFILE [-bf]
+ optional arguments:
+   -h, --help            show this help message and exit
+   -i INPUTFILE, --inputfile INPUTFILE
+                         Dialer code list
+   -o OUTPUTFILE, --outputfile OUTPUTFILE
+                         File to save results
+   -bf, --bruteforce     Bruteforce mode, inputfile not needed
+   -r,  --random         Randomize "*#" digits in Bruteforce mode
+   -l, --list-secrets    List secret codes registered on the device
+   -s SERIAL             adb device serial
 
-@author: sd0lv
-Python 3 rewrite. Original Python 2 versions kept under ./python2/
+  Example:
+  python3 fuzzer_dialer.py -i dialer.lst -o output.txt -bf  --> Dictionary Mode
+  python3 fuzzer_dialer.py -o output.txt -bf  --> Bruteforce Mode
+  python3 fuzzer_dialer.py -o output.txt -bf --random --> Bruteforce Mode, random *# digits
+  python3 fuzzer_dialer.py -s emulator-5554 -l -> List secret codes on a device
+  python3 fuzzer_dialer.py -l -o codes.txt -> List secret codes and save
 
-  ONLY use against devices you are authorized to test. Dial modes trigger the
-  codes they type -- some (factory reset, EEP reset, ...) are destructive.
-  Enumeration mode (-e) is always safe.
 """
 
 import argparse
@@ -39,8 +54,7 @@ import subprocess
 import sys
 import time
 
-
-# --- Logcat markers used to confirm a code was accepted ----------------------
+# Logcat markers used to confirm a code was accepted
 # Samsung firmware logs an explicit "activated = true" line followed by a
 # ParseService line carrying the android_secret_code URI:
 #     NumberLocationModel: ... getNumerLocation(*#1234#) : activated = true
@@ -61,6 +75,25 @@ VENDOR_PROFILES = ("samsung", "generic", "all")
 # Override with --dialer-package for non-Samsung devices, e.g.
 # com.google.android.dialer (Pixel/Xiaomi) or com.android.dialer (AOSP).
 DEFAULT_DIALER_PACKAGE = "com.samsung.android.dialer"
+
+# Shown when a device refuses ADB input injection (typical on MIUI / HyperOS).
+MIUI_ENABLE_HELP = """\
+    On MIUI / HyperOS (Xiaomi / Redmi / POCO), ADB input injection is blocked by
+    default, so the dial modes cannot type the codes. To enable it you must turn
+    on the special "USB debugging (Security settings)" option:
+
+      1. Sign in to a Mi account on the phone AND insert a SIM card
+         (Xiaomi requires both before this option can be toggled).
+      2. Enable Developer Options: Settings > About phone >
+         tap "OS version" (or "MIUI version") 7 times.
+      3. Settings > Additional settings > Developer options:
+           - turn on "USB debugging"
+           - turn on "USB debugging (Security settings)"   <-- the important one
+             (this grants ADB permission to simulate input / manage the device).
+      4. Replug the USB cable and accept the debugging prompt again.
+
+    If you cannot enable it, use the list-secrets mode instead — it needs no
+    input injection and works on any vendor:  fuzzer_dialer.py -l"""
 
 
 class Colors:
@@ -144,6 +177,23 @@ def clean_device_screen(serial, dialer_package):
     adb(serial, ["shell", "pkill", "-f", dialer_package])
 
 
+def input_injection_blocked(serial):
+    """Return an error string if adb input injection is refused, else None.
+
+    On MIUI/HyperOS, `input`/`keyevent` raise a SecurityException (INJECT_EVENTS)
+    unless "USB debugging (Security settings)" is enabled, so dial modes can
+    never type the codes. KEYCODE 0 (UNKNOWN) is a harmless no-op probe.
+    """
+    res = subprocess.run(
+        ["adb", "-s", serial, "shell", "input", "keyevent", "0"],
+        capture_output=True, text=True,
+    )
+    err = ((res.stderr or "") + (res.stdout or "")).strip()
+    if "SecurityException" in err or "INJECT_EVENTS" in err:
+        return err.splitlines()[0] if err else "input injection refused"
+    return None
+
+
 def read_recent_logcat(serial, since):
     """Return logcat lines emitted since the given device timestamp."""
     return adb(serial, ["logcat", "-d", "-t", since], capture=True) or ""
@@ -155,15 +205,6 @@ def device_timestamp(serial):
     return ts
 
 
-# ----------------------------------------------------------------------------
-# Static enumeration (vendor-independent, non-destructive)
-#
-# Secret codes are declared by installed apps as broadcast receivers with an
-# intent-filter for android.provider.Telephony.SECRET_CODE and a data URI
-# android_secret_code://<code>. dumpsys exposes <code> as the filter Authority,
-# so we can list every real code on the device WITHOUT dialing anything -- which
-# also means we never risk triggering a destructive code (e.g. factory reset).
-# ----------------------------------------------------------------------------
 _COMP_RE = re.compile(r"([\w.]+/[\w.$]+)")
 _AUTH_RE = re.compile(r'Authority: "([^"]+)"')
 
@@ -214,7 +255,7 @@ def discover_secret_codes(serial):
 
 
 def render_secret_codes(codes, out):
-    """Print (and optionally save) the enumerated secret code table."""
+    """Print (and optionally save) the listed secret code table."""
     header = "\n" + "*" * 76 + "\n" + \
         (" SECRET CODES REGISTERED ON DEVICE (%d) " % len(codes)).center(76, "*") + \
         "\n" + "*" * 76
@@ -248,10 +289,7 @@ def _report_hit(code, line, out):
 
 
 def match_dialer_code(serial, code, since, out, vendor):
-    """Check logcat for confirmation that `code` was accepted.
-
-    `vendor` is one of VENDOR_PROFILES. Returns the code if accepted, else None.
-    """
+    """Check logcat for confirmation that `code` was accepted"""
     code = code.replace("\\", "")
     digits = re.sub(r"[*#]", "", code)  # e.g. '*#1234#' -> '1234'
     header = "\n" + "*" * 76
@@ -354,21 +392,21 @@ def build_parser():
         description="DIALER CODE FUZZER AND BRUTEFORCER",
         epilog=(
             "Examples:\n"
-            "  fuzzer_dialer.py -e                              # enumerate codes (recommended)\n"
-            "  fuzzer_dialer.py -e -o codes.txt                 # enumerate + save\n"
+            "  fuzzer_dialer.py -l                              # list secret codes (recommended)\n"
+            "  fuzzer_dialer.py -l -o codes.txt                 # list secret codes + save\n"
             "  fuzzer_dialer.py -i dialer.lst -o out.txt        # dictionary (dials codes)\n"
             "  fuzzer_dialer.py -bf -o out.txt                  # bruteforce mode\n"
             "  fuzzer_dialer.py -bf -r -o out.txt               # bruteforce, random *# digits\n"
-            "  fuzzer_dialer.py -s emulator-5554 -e"
+            "  fuzzer_dialer.py -s emulator-5554 -l"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("-e", "--enumerate", action="store_true",
+    p.add_argument("-l", "--list-secrets", action="store_true",
                    help="Statically list the secret codes registered on the "
                         "device (vendor-independent, dials nothing). Recommended.")
     p.add_argument("-i", "--inputfile", help="Dialer code wordlist (dictionary mode)")
     p.add_argument("-o", "--outputfile",
-                   help="File to save results (required unless -e/--enumerate)")
+                   help="File to save results (required unless -l/--list-secrets)")
     p.add_argument("-bf", "--bruteforce", action="store_true",
                    help="Bruteforce mode (no wordlist needed)")
     p.add_argument("-r", "--random", action="store_true",
@@ -393,7 +431,6 @@ def build_parser():
 
 
 class _NullWriter:
-    """File-like sink for when no --outputfile is given."""
     def write(self, *_): pass
     def flush(self): pass
     def close(self): pass
@@ -402,11 +439,11 @@ class _NullWriter:
 def main():
     args = build_parser().parse_args()
 
-    if not args.enumerate:
+    if not args.list_secrets:
         if not args.outputfile:
-            sys.exit(Colors.FAIL + "[!] -o/--outputfile is required (or use -e)." + Colors.ENDC)
+            sys.exit(Colors.FAIL + "[!] -o/--outputfile is required (or use -l)." + Colors.ENDC)
         if not args.bruteforce and not args.inputfile:
-            sys.exit(Colors.FAIL + "[!] Provide a wordlist with -i, or use -bf/-e." + Colors.ENDC)
+            sys.exit(Colors.FAIL + "[!] Provide a wordlist with -i, or use -bf/-l." + Colors.ENDC)
     if args.min_digits < 1 or args.max_digits < args.min_digits:
         sys.exit(Colors.FAIL + "[!] Invalid --min-digits/--max-digits range." + Colors.ENDC)
 
@@ -415,14 +452,27 @@ def main():
 
     out = open(args.outputfile, "a") if args.outputfile else _NullWriter()
 
-    # Enumeration mode: list registered secret codes, dial nothing, then exit.
-    if args.enumerate:
+    # List-secrets mode: list registered secret codes, dial nothing, then exit.
+    if args.list_secrets:
         print(Colors.BOLD + Colors.WARNING
-              + "Enumerating registered secret codes (no codes are dialed)..."
+              + "Listing registered secret codes (no codes are dialed)..."
               + Colors.ENDC)
         render_secret_codes(discover_secret_codes(serial), out)
         out.close()
         return
+
+    # Dial modes must inject input to type codes; MIUI/HyperOS often blocks this
+    # silently. Fail loudly with guidance instead of "dialing" nothing.
+    blocked = input_injection_blocked(serial)
+    if blocked:
+        print(Colors.FAIL + Colors.BOLD
+              + "[!] ADB input injection is blocked on this device:" + Colors.ENDC)
+        print(Colors.FAIL + "    " + blocked + Colors.ENDC)
+        print(Colors.WARNING + "    Codes cannot be typed, so the dial modes "
+              "(-i / -bf) will not work here.\n" + Colors.ENDC)
+        print(Colors.WARNING + MIUI_ENABLE_HELP + Colors.ENDC)
+        out.close()
+        sys.exit(2)
 
     found_codes = []
     done = {"flag": False}
